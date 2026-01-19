@@ -6,9 +6,17 @@ on:
   push:
     branches:
       - master
+    paths-ignore:
+      - docs/**
+      - src/flag_gems/ops/**
+      - src/flag_gems/experimental_ops/**
   pull_request:
     branches:
       - master
+    paths-ignore:
+      - docs/**
+      - src/flag_gems/ops/**
+      - src/flag_gems/experimental_ops/**
   workflow_dispatch:
     inputs:
       push_images:
