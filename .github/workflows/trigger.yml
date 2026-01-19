@@ -10,6 +10,8 @@ on:
       - docs/**
       - src/flag_gems/ops/**
       - src/flag_gems/experimental_ops/**
+      - tests/**
+      - experimental_tests/**
   pull_request:
     branches:
       - master
@@ -17,6 +19,8 @@ on:
       - docs/**
       - src/flag_gems/ops/**
       - src/flag_gems/experimental_ops/**
+      - tests/**
+      - experimental_tests/**
   workflow_dispatch:
     inputs:
       push_images:
