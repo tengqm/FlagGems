@@ -4,13 +4,26 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-import flag_gems
+from flag_gems.fused import apply_repetition_penalties
+from flag_gems.fused import concat_and_cache_mla
+from flag_gems.fused import cutlass_scaled_mm
+from flag_gems.fused import flash_mla
+from flag_gems.fused import grouped_topk
+from flag_gems.fused import moe_align_block_size_triton
+from flag_gems.fused import reshape_and_cache
+from flag_gems.fused import reshape_and_cache_flash
+from flag_gems.fused import silu_and_mul_out
+from flag_gems.fused import topk_softmax
+from flag_gems.modules.activation import gems_silu_and_mul
+from flag_gems.modules.normalization import gems_rms_forward
+from flag_gems.modules.rotary_embedding import gems_rope_forward
 from flag_gems.patches.patch_util import patch_module_method, patch_vllm_lib
+from flag_gems.ops import flash_attn_varlen_func
+from flag_gems.ops import get_scheduler_metadata
+from flag_gems.ops import per_token_group_quant_fp8
 
 
 def custom_gems_rms_forward_cuda(self, x, residual=None):
-    from flag_gems.modules.normalization import gems_rms_forward
-
     return gems_rms_forward(x, residual, self.weight, self.variance_epsilon)
 
 
@@ -21,7 +34,6 @@ def custom_gems_rope_forward_cuda(
     key: torch.Tensor,
     offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from flag_gems.modules.rotary_embedding import gems_rope_forward
 
     self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
     if offsets is not None:
@@ -37,8 +49,8 @@ def custom_gems_rope_forward_cuda(
     query_rot = query[..., : self.rotary_dim]
     key_rot = key[..., : self.rotary_dim]
     if self.rotary_dim < self.head_size:
-        query_pass = query[..., self.rotary_dim :]
-        key_pass = key[..., self.rotary_dim :]
+        query_pass = query[..., self.rotary_dim:]
+        key_pass = key[..., self.rotary_dim:]
 
     cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
 
@@ -63,7 +75,6 @@ def custom_gems_rope_forward_cuda(
 
 
 def custom_gems_silu_and_mul(self, x: torch.Tensor) -> torch.Tensor:
-    from flag_gems.modules.activation import gems_silu_and_mul
 
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
@@ -71,43 +82,21 @@ def custom_gems_silu_and_mul(self, x: torch.Tensor) -> torch.Tensor:
 
 
 def custom_gems_write_to_paged_cache(
-    key,
-    value,
-    key_cache,
-    value_cache,
-    slot_mapping,
-    kv_cache_dtype,
-    k_scale,
-    v_scale,
-):
-    from flag_gems.fused.reshape_and_cache import reshape_and_cache
+        key, value, key_cache, value_cache,
+        slot_mapping, kv_cache_dtype, k_scale, v_scale):
 
-    reshape_and_cache(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping.flatten(),
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
-    )
+    reshape_and_cache(key, value, key_cache, value_cache,
+                      slot_mapping.flatten(), kv_cache_dtype, k_scale, v_scale)
 
 
 def custom_gems_flash_mla_forward(
-    self,
-    q_nope,
-    q_pe,
-    kv_c_and_k_pe_cache,
-    attn_metadata,
-) -> torch.Tensor:
-    from flag_gems.fused import flash_mla
+        self, q_nope, q_pe, kv_c_and_k_pe_cache, attn_metadata) -> torch.Tensor:
 
     assert kv_c_and_k_pe_cache.numel() > 0
     assert attn_metadata.decode is not None
 
     if self.kv_cache_dtype.startswith("fp8"):
-        raise NotImplementedError("FP8 Triton MLA not yet supported")
+        raise NotImplementedError("FP8 Triton MLA not supported yet")
 
     batch, num_head_q, head_dim_v = q_nope.shape
     seqlen_q = 1
@@ -154,13 +143,12 @@ def custom_gems_flash_attention_impl_forward(
     output_block_scale: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    from flag_gems import flash_attn_varlen_func, reshape_and_cache_flash
 
     assert output is not None, "Output tensor must be provided."
 
     if output_scale is not None:
         raise NotImplementedError(
-            "fused output quantization is not yet supported" " for FlashAttentionImpl"
+            "fused output quantization is not yet supported for FlashAttentionImpl"
         )
 
     if attn_metadata is None:
@@ -250,13 +238,13 @@ def custom_gems_flash_attention_impl_forward(
         return output
 
     # TODO: Support cascade_attention.
-    raise NotImplementedError("Cascade attention is not implemented in flag_gems.")
+    raise NotImplementedError("Cascade attention is not implemented.")
 
 
 def custom_silu_and_mul(out: torch.Tensor, input: torch.Tensor):
     d = input.size(-1) // 2
     x, y = input.split(d, dim=-1)
-    flag_gems.silu_and_mul_out(x, y, out)
+    silu_and_mul_out(x, y, out)
 
 
 def custom_moe_align_block_size(
@@ -267,7 +255,7 @@ def custom_moe_align_block_size(
     experts_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
 ):
-    flag_gems.moe_align_block_size_triton(
+    moe_align_block_size_triton(
         topk_ids,
         num_experts,
         block_size,
@@ -287,7 +275,6 @@ def custom_moe_grouped_topk(
     bias: torch.Tensor,
     scoring_func: int = 0,
 ):
-    from flag_gems.fused import grouped_topk
 
     return grouped_topk(
         scores=gating_output,
@@ -304,7 +291,7 @@ def custom_moe_grouped_topk(
 def custom_topk_softmax(
     topk_weights, topk_indices, token_expert_indices, gating_output, renormalize=False
 ):
-    flag_gems.topk_softmax(
+    topk_softmax(
         topk_weights, topk_indices, token_expert_indices, gating_output, renormalize
     )
 
@@ -315,7 +302,7 @@ def custom_apply_repetition_penalties(
     output_mask: torch.Tensor,
     repetition_penalties: torch.Tensor,
 ):
-    return flag_gems.apply_repetition_penalties(
+    return apply_repetition_penalties(
         logits, prompt_mask, output_mask, repetition_penalties
     )
 
@@ -345,7 +332,7 @@ def custom_get_scheduler_metadata(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
 ):
-    return flag_gems.get_scheduler_metadata(
+    return get_scheduler_metadata(
         batch_size,
         max_seqlen_q,
         max_seqlen_k,
@@ -382,7 +369,6 @@ def custom_per_token_group_fp8_quant(
     fp8_max: float,
     scale_ue8m0: bool = False,
 ):
-    from flag_gems.ops import per_token_group_quant_fp8
 
     column_major_scales = output_s.stride(0) < output_s.stride(1)
 
@@ -406,7 +392,7 @@ def custom_cutlass_scaled_mm(
     scale_b: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    return flag_gems.cutlass_scaled_mm(output, input, weight, scale_a, scale_b, bias)
+    return cutlass_scaled_mm(output, input, weight, scale_a, scale_b, bias)
 
 
 def custom_concat_and_cache_mla(
@@ -417,7 +403,7 @@ def custom_concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    return flag_gems.concat_and_cache_mla(
+    return concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
 
@@ -429,7 +415,6 @@ def custom_gems_flashattn_mla_forward_decode(
     attn_metadata,  # FlashAttnMLAMetadata
     layer,  # AttentionLayer
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from flag_gems import flash_attn_varlen_func
 
     assert kv_c_and_k_pe_cache.numel() > 0
     assert attn_metadata.decode is not None
@@ -437,15 +422,13 @@ def custom_gems_flashattn_mla_forward_decode(
     if type(q) is tuple:
         q_nope, q_pe = q
     else:
-        q_nope, q_pe = torch.split(
-            q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        q_nope, q_pe = torch.split(q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
     if self.kv_cache_dtype.startswith("fp8"):
         raise NotImplementedError("FP8 FlashAttention MLA not yet supported")
 
     kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
-    k_pe_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :]
+    k_pe_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank:]
 
     # NOTE(matt): During CUDA graph capture, max_query_len can be 0, but the
     # kernel uses this to calculate grid dimensions. Ensure it's at least 1
@@ -531,63 +514,38 @@ def apply_gems_patches_to_vllm(verbose=True):
     from vllm.v1.attention.backends.mla.flashattn_mla import FlashAttnMLAImpl
     from vllm.v1.attention.backends.mla.triton_mla import TritonMLAImpl
 
-    patch_module_method(RMSNorm, "forward_cuda", custom_gems_rms_forward_cuda, verbose)
-    patch_module_method(
-        RotaryEmbedding, "forward_cuda", custom_gems_rope_forward_cuda, verbose
-    )
-    patch_module_method(
-        PagedAttention,
-        "write_to_paged_cache",
-        custom_gems_write_to_paged_cache,
-        verbose,
-    )
-    patch_module_method(SiluAndMul, "forward_cuda", custom_gems_silu_and_mul, verbose)
-    patch_module_method(
-        TritonMLAImpl, "_forward_decode", custom_gems_flash_mla_forward, verbose
-    )
-    patch_module_method(
-        FlashAttentionImpl, "forward", custom_gems_flash_attention_impl_forward, verbose
-    )
-    patch_module_method(
-        FlashAttnMLAImpl,
-        "_forward_decode",
-        custom_gems_flashattn_mla_forward_decode,
-        verbose,
-    )
-    patch_vllm_lib("_C", "silu_and_mul", custom_silu_and_mul, "CUDA", verbose)
-    patch_vllm_lib("_C", "cutlass_scaled_mm", custom_cutlass_scaled_mm, "CUDA", verbose)
-    patch_vllm_lib(
-        "_moe_C", "moe_align_block_size", custom_moe_align_block_size, "CUDA", verbose
-    )
-    patch_vllm_lib("_moe_C", "topk_softmax", custom_topk_softmax, "CUDA", verbose)
-    patch_vllm_lib(
-        "_vllm_fa3_C",
-        "get_scheduler_metadata",
-        custom_get_scheduler_metadata,
-        "CUDA",
-        verbose,
-    )
-    patch_vllm_lib("_moe_C", "grouped_topk", custom_moe_grouped_topk, "CUDA", verbose)
-    patch_vllm_lib(
-        "_C",
-        "per_token_group_fp8_quant",
-        custom_per_token_group_fp8_quant,
-        "CUDA",
-        verbose,
-    )
-    patch_vllm_lib(
-        "_C",
-        "apply_repetition_penalties_",
-        custom_apply_repetition_penalties,
-        "CUDA",
-        verbose,
-    )
+    patch_module_method(RMSNorm, "forward_cuda",
+                        custom_gems_rms_forward_cuda, verbose)
+    patch_module_method(RotaryEmbedding, "forward_cuda",
+                        custom_gems_rope_forward_cuda, verbose)
+    patch_module_method(PagedAttention, "write_to_paged_cache",
+                        custom_gems_write_to_paged_cache, verbose)
+    patch_module_method(SiluAndMul, "forward_cuda",
+                        custom_gems_silu_and_mul, verbose)
+    patch_module_method(TritonMLAImpl, "_forward_decode",
+                        custom_gems_flash_mla_forward, verbose)
+    patch_module_method(FlashAttentionImpl, "forward",
+                        custom_gems_flash_attention_impl_forward, verbose)
+    patch_module_method(FlashAttnMLAImpl, "_forward_decode",
+                        custom_gems_flashattn_mla_forward_decode, verbose)
 
-    patch_vllm_lib(
-        "_C_cache_ops",
-        "concat_and_cache_mla",
-        custom_concat_and_cache_mla,
-        "CUDA",
-        verbose,
-    )
+    patch_vllm_lib("_C", "silu_and_mul",
+                   custom_silu_and_mul, "CUDA", verbose)
+    patch_vllm_lib("_C", "cutlass_scaled_mm",
+                   custom_cutlass_scaled_mm, "CUDA", verbose)
+    patch_vllm_lib("_moe_C", "moe_align_block_size",
+                   custom_moe_align_block_size, "CUDA", verbose)
+    patch_vllm_lib("_moe_C", "topk_softmax",
+                   custom_topk_softmax, "CUDA", verbose)
+    patch_vllm_lib("_vllm_fa3_C", "get_scheduler_metadata",
+                   custom_get_scheduler_metadata, "CUDA", verbose)
+    patch_vllm_lib("_moe_C", "grouped_topk",
+                   custom_moe_grouped_topk, "CUDA", verbose)
+    patch_vllm_lib("_C", "per_token_group_fp8_quant",
+                   custom_per_token_group_fp8_quant, "CUDA", verbose)
+    patch_vllm_lib("_C", "apply_repetition_penalties_",
+                   custom_apply_repetition_penalties, "CUDA", verbose)
+    patch_vllm_lib("_C_cache_ops", "concat_and_cache_mla",
+                   custom_concat_and_cache_mla, "CUDA", verbose)
+
     patch_vllm_vit_to_attn(vitw)
