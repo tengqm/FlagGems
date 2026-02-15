@@ -28,7 +28,9 @@ def _prepare_addcdiv_tensors(self, tensor1, tensor2):
         )
     if not (self.device == tensor1.device == tensor2.device):
         raise ValueError("All tensors must be on the same CUDA device.")
+
     a, b, c = torch.broadcast_tensors(self, tensor1, tensor2)
+
     # Determine common dtype for computation
     common_dtype = torch.promote_types(torch.promote_types(a.dtype, b.dtype), c.dtype)
     a = a.to(dtype=common_dtype).contiguous()
