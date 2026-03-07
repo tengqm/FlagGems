@@ -17,7 +17,7 @@ else
 fi
 
 # Temporary hack
-CHANGE_FILES=(
+CHANGED_FILES=(
   "tests/test_libentry.py"
 )
 
