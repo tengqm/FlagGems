@@ -63,7 +63,7 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          sparse-checkout: .github/backends.yaml
+          sparse-checkout: .github/backends.json
           sparse-checkout-cone-mode: false
 
       - id: build-backend-matrix
@@ -71,8 +71,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const yaml = require('js-yaml');
-            const backends = yaml.load(fs.readFileSync('.github/backends.yaml', 'utf8'));
+            const backends = JSON.parse(fs.readFileSync('.github/backends.json', 'utf8'));
             const labels = JSON.parse(${{ steps.get-labels.outputs.result }} || '[]');
             const matrix = backends.filter(b => b.enabled && labels.includes(b.label));
             core.setOutput('matrix', JSON.stringify(matrix));
