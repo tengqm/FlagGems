@@ -374,6 +374,16 @@ def _probe_triton():
 def _probe_flaggems():
     try:
         version = flag_gems.__version__
+        if version == "unknown":
+            # Fallback for PYTHONPATH mode: use git describe
+            result = subprocess.run(
+                ["git", "describe", "--tags", "--always"],
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+            )
+            if result.returncode == 0:
+                version = result.stdout.strip()
         ENV_INFO["flag_gems"] = {"version": version}
         pinfo(f"flag_gems detected ... {version}")
     except Exception as e:
